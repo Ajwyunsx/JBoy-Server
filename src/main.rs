@@ -395,30 +395,45 @@ async fn leave_room(
         ready_set.remove(&player);
     }
 
-    let mut rooms = state.rooms.write().await;
-    let room = rooms
-        .get_mut(&room_id)
-        .ok_or_else(|| error_json(StatusCode::NOT_FOUND, "房间不存在"))?;
+    let (room_snapshot, room_deleted) = {
+        let mut rooms = state.rooms.write().await;
+        let room = rooms
+            .get_mut(&room_id)
+            .ok_or_else(|| error_json(StatusCode::NOT_FOUND, "房间不存在"))?;
 
-    room.players.retain(|p| p != &player);
-    room.admins.retain(|a| a != &player);
+        room.players.retain(|p| p != &player);
+        room.admins.retain(|a| a != &player);
 
-    if room.players.is_empty() {
-        room.owner.clear();
-        room.admins.clear();
-    } else if room.owner == player {
-        room.owner = room.players[0].clone();
-        if !room.admins.contains(&room.owner) {
+        if room.players.is_empty() {
+            room.owner.clear();
+            room.admins.clear();
+        } else if room.owner == player {
+            room.owner = room.players[0].clone();
+            if !room.admins.contains(&room.owner) {
+                room.admins.push(room.owner.clone());
+            }
+        }
+
+        if room.admins.is_empty() && !room.owner.is_empty() {
             room.admins.push(room.owner.clone());
         }
-    }
 
-    if room.admins.is_empty() && !room.owner.is_empty() {
-        room.admins.push(room.owner.clone());
+        let snapshot = room.clone();
+        let should_delete = room.players.is_empty();
+        if should_delete {
+            rooms.remove(&room_id);
+        }
+        (snapshot, should_delete)
+    };
+
+    if room_deleted {
+        state.room_channels.write().await.remove(&room_id);
+        state.room_ready.write().await.remove(&room_id);
+        info!("Room auto-deleted after leave: {}", room_id);
     }
 
     info!("Player left room {}: {}", room_id, player);
-    Ok(Json(room.clone()))
+    Ok(Json(room_snapshot))
 }
 
 async fn kick_player(
@@ -447,34 +462,49 @@ async fn kick_player(
         ready_set.remove(&target);
     }
 
-    let mut rooms = state.rooms.write().await;
-    let room = rooms
-        .get_mut(&room_id)
-        .ok_or_else(|| error_json(StatusCode::NOT_FOUND, "房间不存在"))?;
+    let (room_snapshot, room_deleted) = {
+        let mut rooms = state.rooms.write().await;
+        let room = rooms
+            .get_mut(&room_id)
+            .ok_or_else(|| error_json(StatusCode::NOT_FOUND, "房间不存在"))?;
 
-    if !room.players.contains(&target) {
-        return Err(error_json(StatusCode::NOT_FOUND, "目标玩家不在房间中"));
-    }
+        if !room.players.contains(&target) {
+            return Err(error_json(StatusCode::NOT_FOUND, "目标玩家不在房间中"));
+        }
 
-    room.players.retain(|p| p != &target);
-    room.admins.retain(|a| a != &target);
+        room.players.retain(|p| p != &target);
+        room.admins.retain(|a| a != &target);
 
-    if room.players.is_empty() {
-        room.owner.clear();
-        room.admins.clear();
-    } else if room.owner == target {
-        room.owner = room.players[0].clone();
-        if !room.admins.contains(&room.owner) {
+        if room.players.is_empty() {
+            room.owner.clear();
+            room.admins.clear();
+        } else if room.owner == target {
+            room.owner = room.players[0].clone();
+            if !room.admins.contains(&room.owner) {
+                room.admins.push(room.owner.clone());
+            }
+        }
+
+        if room.admins.is_empty() && !room.owner.is_empty() {
             room.admins.push(room.owner.clone());
         }
-    }
 
-    if room.admins.is_empty() && !room.owner.is_empty() {
-        room.admins.push(room.owner.clone());
+        let snapshot = room.clone();
+        let should_delete = room.players.is_empty();
+        if should_delete {
+            rooms.remove(&room_id);
+        }
+        (snapshot, should_delete)
+    };
+
+    if room_deleted {
+        state.room_channels.write().await.remove(&room_id);
+        state.room_ready.write().await.remove(&room_id);
+        info!("Room auto-deleted after kick: {}", room_id);
     }
 
     info!("Player kicked room {}: {}", room_id, target);
-    Ok(Json(room.clone()))
+    Ok(Json(room_snapshot))
 }
 
 async fn ws_room(
@@ -691,13 +721,57 @@ async fn handle_ws(state: AppState, room_id: String, player: String, socket: Web
     })
     .unwrap_or_else(|_| "{\"event\":\"leave\"}".to_string());
     let _ = tx.send(leave_msg);
+
     {
         let mut ready = state.room_ready.write().await;
         if let Some(room_ready) = ready.get_mut(&room_id) {
             room_ready.remove(&player);
         }
     }
-    if let Some(sync) = build_link_sync_payload(&state, &room_id).await {
+
+    let room_deleted = {
+        let mut rooms = state.rooms.write().await;
+        let mut should_delete = false;
+        if let Some(room) = rooms.get_mut(&room_id) {
+            room.players.retain(|p| p != &player);
+            room.admins.retain(|a| a != &player);
+            if room.players.is_empty() {
+                room.owner.clear();
+                room.admins.clear();
+                should_delete = true;
+            } else if room.owner == player {
+                room.owner = room.players[0].clone();
+                if !room.admins.contains(&room.owner) {
+                    room.admins.push(room.owner.clone());
+                }
+            }
+
+            if room.admins.is_empty() && !room.owner.is_empty() {
+                room.admins.push(room.owner.clone());
+            }
+
+            if should_delete {
+                rooms.remove(&room_id);
+            }
+        }
+        should_delete
+    };
+
+    if room_deleted {
+        let room_closed = serde_json::to_string(&WsEnvelope {
+            event: "room_closed",
+            room_id: &room_id,
+            player: &player,
+            payload: "empty",
+            ts: Utc::now(),
+        })
+        .unwrap_or_else(|_| "{\"event\":\"room_closed\"}".to_string());
+        let _ = tx.send(room_closed);
+
+        state.room_channels.write().await.remove(&room_id);
+        state.room_ready.write().await.remove(&room_id);
+        info!("Room auto-deleted after websocket disconnect: {}", room_id);
+    } else if let Some(sync) = build_link_sync_payload(&state, &room_id).await {
         let sync_msg = serde_json::to_string(&WsEnvelope {
             event: "protocol",
             room_id: &room_id,
@@ -707,23 +781,6 @@ async fn handle_ws(state: AppState, room_id: String, player: String, socket: Web
         })
         .unwrap_or_else(|_| sync);
         let _ = tx.send(sync_msg);
-    }
-
-    {
-        let mut rooms = state.rooms.write().await;
-        if let Some(room) = rooms.get_mut(&room_id) {
-            room.players.retain(|p| p != &player);
-            room.admins.retain(|a| a != &player);
-            if room.players.is_empty() {
-                room.owner.clear();
-                room.admins.clear();
-            } else if room.owner == player {
-                room.owner = room.players[0].clone();
-                if !room.admins.contains(&room.owner) {
-                    room.admins.push(room.owner.clone());
-                }
-            }
-        }
     }
 
     info!("WebSocket disconnected room={} player={}", room_id, player);
